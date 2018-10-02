@@ -1,0 +1,618 @@
+#!/usr/bin/env ruby
+# -*- coding: binary -*-
+
+class MsfVenomError < StandardError; end
+class HelpError < StandardError; end
+class UsageError < MsfVenomError; end
+
+require 'base64'
+require 'json'
+require 'net/http'
+require 'optparse'
+require 'timeout'
+
+@dependencies_loaded = false
+@id = 0
+
+def require_dependencies
+  return if @dependencies_loaded
+
+  msfbase = __FILE__
+  while File.symlink?(msfbase)
+    msfbase = File.expand_path(File.readlink(msfbase), File.dirname(msfbase))
+  end
+
+  @framework_lib_path = File.expand_path(File.join(File.dirname(msfbase), 'lib'))
+  $LOAD_PATH << @framework_lib_path unless $LOAD_PATH.include?(@framework_lib_path)
+
+  if ENV['MSF_LOCAL_LIB']
+    $LOAD_PATH << ENV['MSF_LOCAL_LIB'] unless $LOAD_PATH.include?(ENV['MSF_LOCAL_LIB'])
+  end
+
+  require 'rex'
+  @dependencies_loaded = true
+end
+
+def parse_args(args)
+  opts = {}
+  datastore = {}
+  opt = OptionParser.new
+  banner = "MsfVenom - a Metasploit standalone payload generator.\n"
+  banner << "Also a replacement for msfpayload and msfencode.\n"
+  banner << "Usage: #{$0} [options] <var=val>\n"
+  banner << "Example: #{$0} -p windows/meterpreter/reverse_tcp LHOST=<IP> -f exe -o payload.exe"
+  opt.banner = banner
+  opt.separator('')
+  opt.separator('Options:')
+
+  opt.on('-l', '--list            <type>', Array, 'List all modules for [type]. Types are: payloads, encoders, nops, platforms, archs, encrypt, formats, all') do |l|
+    if l.to_s.empty?
+      l = ["all"]
+    end
+    opts[:list] = l
+  end
+
+  opt.on('-p', '--payload         <payload>', String,
+         "Payload to use (--list payloads to list, --list-options for arguments). Specify '-' or STDIN for custom") do |p|
+    if p == '-'
+      opts[:payload] = 'stdin'
+    else
+      opts[:payload] = p
+    end
+  end
+
+  opt.on('--list-options', "List --payload <value>'s standard, advanced and evasion options") do
+    opts[:list_options] = true
+  end
+
+  opt.on('-f', '--format          <format>', String, "Output format (use --list formats to list)") do |f|
+    opts[:format] = f
+  end
+
+  opt.on('-e', '--encoder         <encoder>', String, 'The encoder to use (use --list encoders to list)') do |e|
+    opts[:encoder] = e
+  end
+
+  opt.on('--smallest', 'Generate the smallest possible payload using all available encoders') do
+    opts[:smallest] = true
+  end
+
+  opt.on('--encrypt         <value>', String, 'The type of encryption or encoding to apply to the shellcode (use --list encrypt to list)') do |e|
+    opts[:encryption_format] = e
+  end
+
+  opt.on('--encrypt-key     <value>', String, 'A key to be used for --encrypt') do |e|
+    opts[:encryption_key] = e
+  end
+
+  opt.on('--encrypt-iv      <value>', String, 'An initialization vector for --encrypt') do |e|
+    opts[:encryption_iv] = e
+  end
+
+  opt.on('-a', '--arch            <arch>', String, 'The architecture to use for --payload and --encoders (use --list archs to list)') do |a|
+    opts[:arch] = a
+  end
+
+  opt.on('--platform        <platform>', String, 'The platform for --payload (use --list platforms to list)') do |l|
+    opts[:platform] = l
+  end
+
+  opt.on('-o', '--out             <path>', 'Save the payload to a file') do |x|
+    opts[:out] = x
+  end
+
+  opt.on('-b', '--bad-chars       <list>', String, 'Characters to avoid example: \'\x00\xff\'') do |b|
+    # TODO: encode?
+    opts[:badchars] = b
+  end
+
+  opt.on('-n', '--nopsled         <length>', Integer, 'Prepend a nopsled of [length] size on to the payload') do |n|
+    opts[:nops] = n.to_i
+  end
+
+  opt.on('-s', '--space           <length>', Integer, 'The maximum size of the resulting payload') do |s|
+    opts[:space] = s
+  end
+
+  opt.on('--encoder-space   <length>', Integer, 'The maximum size of the encoded payload (defaults to the -s value)') do |s|
+    opts[:encoder_space] = s
+  end
+
+  opt.on('-i', '--iterations      <count>', Integer, 'The number of times to encode the payload') do |i|
+    opts[:iterations] = i
+  end
+
+  opt.on('-c', '--add-code        <path>', String, 'Specify an additional win32 shellcode file to include') do |x|
+    opts[:add_code] = x
+  end
+
+  opt.on('-x', '--template        <path>', String, 'Specify a custom executable file to use as a template') do |x|
+    opts[:template] = x
+  end
+
+  opt.on('-k', '--keep', 'Preserve the --template behaviour and inject the payload as a new thread') do
+    opts[:keep] = true
+  end
+
+  opt.on('-v', '--var-name        <value>', String, 'Specify a custom variable name to use for certain output formats') do |x|
+    opts[:var_name] = x
+  end
+
+  opt.on('-t', '--timeout         <second>', Integer, "The number of seconds to wait when reading the payload from STDIN (default 30, 0 to disable)") do |x|
+    opts[:timeout] = x
+  end
+
+  opt.on('--service         <URL>', String, 'The JSON-RPC service (future payload service) endpoint used for payload generation') do |s|
+    opts[:service] = s
+  end
+  opt.on('--token           <token>', String, 'The API token used to authenticate to the payload service') do |t|
+    opts[:token] = t
+  end
+
+  opt.on_tail('-h', '--help', 'Show this message') do
+    raise HelpError, "#{opt}"
+  end
+
+  begin
+    opt.parse!(args)
+  rescue OptionParser::InvalidOption => e
+    raise UsageError, "Invalid option\n#{opt}"
+  rescue OptionParser::MissingArgument => e
+    raise UsageError, "Missing required argument for option\n#{opt}"
+  end
+
+  if opts.empty?
+    raise UsageError, "No options\n#{opt}"
+  end
+
+  if opts[:service].nil?
+    raise UsageError, "No JSON-RPC service (future payload service) endpoint\n#{opt}"
+  else
+    @service_url = opts[:service]
+  end
+
+  if opts[:token].nil?
+    raise UsageError, "No API token\n#{opt}"
+  else
+    @token = opts[:token]
+  end
+
+  if args
+    args.each do |x|
+      k,v = x.split('=', 2)
+      datastore[k.upcase] = v.to_s
+    end
+    if opts[:payload].to_s =~ /[\_\/]reverse/ && datastore['LHOST'].nil?
+      # require additional dependencies on-demand
+      require_dependencies
+      datastore['LHOST'] = Rex::Socket.source_address
+    end
+  end
+
+  if opts[:payload].nil? # if no payload option is selected assume we are reading it from stdin
+    opts[:payload] = "stdin"
+  end
+
+  if opts[:payload].downcase == 'stdin' && !opts[:list]
+    $stderr.puts "Attempting to read payload from STDIN..."
+    begin
+      opts[:timeout] ||= 30
+      ::Timeout.timeout(opts[:timeout]) do
+        opts[:stdin] = payload_stdin
+      end
+    rescue Timeout::Error
+      opts[:stdin] = ''
+    end
+  end
+
+  opts[:datastore] = datastore
+
+  $stderr.puts("opts=#{opts}")  # TODO: remove
+  $stderr.puts("datastore=#{datastore}, ")  # TODO: remove
+
+  opts
+end
+
+# Read a raw payload from stdin (or whatever IO object we're currently
+# using as stdin, see {#initialize})
+#
+# @return [String]
+def payload_stdin
+  @in = $stdin
+  @in.binmode
+  payload = @in.read
+  payload
+end
+
+def get_new_id
+  @id = @id + 1
+end
+
+def dump_platforms
+  require_dependencies
+
+  params = {
+      jsonrpc: '2.0',
+      method: 'module.platforms',
+      id: get_new_id,
+  }
+  data = call_rpc(params)
+  supported_platforms = data[:result]
+
+  tbl = Rex::Text::Table.new(
+    'Indent'  => 4,
+    'Header'  => "Framework Platforms [--platform <value>]",
+    'Columns' =>
+    [
+      "Name",
+    ])
+
+  supported_platforms.each { |name| tbl << [name] }
+
+  "\n#{tbl.to_s}\n"
+end
+
+def dump_archs
+  require_dependencies
+
+  params = {
+      jsonrpc: '2.0',
+      method: 'module.architectures',
+      id: get_new_id,
+  }
+  data = call_rpc(params)
+  supported_archs = data[:result]
+
+  tbl = Rex::Text::Table.new(
+    'Indent'  => 4,
+    'Header'  => "Framework Architectures [--arch <value>]",
+    'Columns' =>
+    [
+      "Name",
+    ])
+
+  supported_archs.each { |name| tbl << [name] }
+
+  "\n#{tbl.to_s}\n"
+end
+
+def dump_encrypt
+  require_dependencies
+
+  params = {
+      jsonrpc: '2.0',
+      method: 'module.encryption_formats',
+      id: get_new_id,
+  }
+  data = call_rpc(params)
+  supported_encryption_formats = data[:result]
+
+  tbl = Rex::Text::Table.new(
+    'Indent'  => 4,
+    'Header'  => "Framework Encryption Formats [--encrypt <value>]",
+    'Columns' =>
+    [
+      "Name",
+    ])
+
+  supported_encryption_formats.each { |name| tbl << [name] }
+
+  "\n#{tbl.to_s}\n"
+end
+
+def dump_formats
+  "\n#{dump_executable_formats}\n#{dump_transform_formats}\n"
+end
+
+def dump_executable_formats
+  require_dependencies
+
+  params = {
+      jsonrpc: '2.0',
+      method: 'module.executable_formats',
+      id: get_new_id,
+  }
+  data = call_rpc(params)
+  supported_executable_formats = data[:result]
+
+  tbl = Rex::Text::Table.new(
+    'Indent'  => 4,
+    'Header'  => "Framework Executable Formats [--format <value>]",
+    'Columns' =>
+    [
+      "Name"
+    ])
+
+  supported_executable_formats.each { |name| tbl << [name] }
+
+  tbl.to_s
+end
+
+def dump_transform_formats
+  require_dependencies
+
+  params = {
+      jsonrpc: '2.0',
+      method: 'module.transform_formats',
+      id: get_new_id,
+  }
+  data = call_rpc(params)
+  supported_transform_formats = data[:result]
+
+  tbl = Rex::Text::Table.new(
+    'Indent'  => 4,
+    'Header'  => "Framework Transform Formats [--format <value>]",
+    'Columns' =>
+    [
+      "Name"
+    ])
+
+  supported_transform_formats.each { |name| tbl << [name] }
+
+  tbl.to_s
+end
+
+def dump_payloads(arch = nil)
+  require_dependencies
+
+  params = ['description']
+  params << arch unless arch.nil?
+  request = {
+      jsonrpc: '2.0',
+      method: 'module.payloads',
+      id: get_new_id,
+      params: params
+  }
+  data = call_rpc(request)
+  supported_payloads = data[:result][:modules]
+
+  tbl = Rex::Text::Table.new(
+    'Indent'  => 4,
+    'Header'  => "Framework Payloads (#{supported_payloads.size} total) [--payload <value>]",
+    'Columns' =>
+    [
+      "Name",
+      "Description"
+    ])
+
+  supported_payloads.each do |name, module_info |
+    tbl << [ name, module_info[:description].split.join(' ') ]
+  end
+
+  "\n#{tbl.to_s}\n"
+end
+
+def dump_encoders(arch = nil)
+  require_dependencies
+
+  params = ['rank, name']
+  params << arch unless arch.nil?
+  request = {
+      jsonrpc: '2.0',
+      method: 'module.encoders',
+      id: get_new_id,
+      params: params
+  }
+  data = call_rpc(request)
+  supported_encoders = data[:result][:modules]
+
+  header_arch_list = !arch.nil? ? " (architectures: #{arch})" : ''
+  tbl = Rex::Text::Table.new(
+    'Indent'  => 4,
+    'Header'  => "Framework Encoders#{header_arch_list} [--encoder <value>]",
+    'Columns' =>
+    [
+      "Name",
+      "Rank",
+      "Description"
+    ])
+
+  cnt = 0
+  supported_encoders.each do |name, module_info |
+    tbl << [ name, module_info[:rank], module_info[:name] ]
+    cnt += 1
+  end
+
+  (cnt > 0) ? "\n#{tbl.to_s}\n" : "\nNo compatible encoders found.\n\n"
+end
+
+def dump_nops(arch = nil)
+  require_dependencies
+
+  params = ['description']
+  params << arch unless arch.nil?
+  request = {
+      jsonrpc: '2.0',
+      method: 'module.nops',
+      id: get_new_id,
+      params: params
+  }
+  data = call_rpc(request)
+  supported_nops = data[:result][:modules]
+
+  tbl = Rex::Text::Table.new(
+    'Indent'  => 4,
+    'Header'  => "Framework NOPs (#{supported_nops.size} total)",
+    'Columns' =>
+    [
+      "Name",
+      "Description"
+    ])
+
+  supported_nops.each do |name, module_info |
+    tbl << [ name, module_info[:description].split.join(' ') ]
+  end
+
+  "\n#{tbl.to_s}\n"
+end
+
+def create_generate_payload_request(generator_opts)
+
+  # TODO: verify all options have been mapped correctly
+
+  $stderr.puts("generator_opts=#{generator_opts}")
+  $stderr.puts("")
+
+  payload_opts = {}
+  # payload_opts.merge!(generator_opts[:datastore])
+
+  payload_opts[:BadChars] = generator_opts[:badchars] unless generator_opts[:badchars].nil?  # TODO: encode to \uXXXX string
+  payload_opts[:Encoder] = generator_opts[:encoder] unless generator_opts[:encoder].nil?
+  # Note: if format not provided RPC _run_payload method will assign 'raw'
+  payload_opts[:Format] = generator_opts[:format] unless generator_opts[:format].nil?
+  payload_opts[:Iterations] = generator_opts[:iterations] unless generator_opts[:iterations].nil?
+  payload_opts[:NopSledSize] = generator_opts[:nops] unless generator_opts[:nops].nil?
+
+  payload_opts[:Options] = generator_opts
+  payload_opts[:Platform] = generator_opts[:platform] unless generator_opts[:platform].nil?
+
+  params = {
+      jsonrpc: '2.0',
+      method: 'module.execute',
+      id: get_new_id,
+      params: [
+          'payload',
+          generator_opts[:payload],
+          payload_opts
+      ]
+  }
+
+  params
+end
+
+def call_rpc(opts)
+  @headers = {
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+      'Authorization': "Bearer #{@token}"
+  }
+
+  $stderr.puts("call_rpc(): opts=#{opts}")
+  begin
+    uri = URI.parse(@service_url)
+    http = Net::HTTP.new(uri.host, uri.port)
+    response = http.post(uri.path, opts.to_json, initheader=@headers)
+
+    case response
+    when Net::HTTPSuccess
+      data = JSON.parse(response.body, symbolize_names: true)
+    else
+      data = { 'error' => response.message }
+    end
+
+  rescue Errno::ECONNREFUSED => e
+    data = { 'error' => e.message }
+  end
+
+  $stderr.puts("call_rpc(): data=#{data}")
+  data
+end
+
+
+
+begin
+  generator_opts = parse_args(ARGV)
+rescue HelpError => e
+  $stderr.puts e.message
+  exit(1)
+rescue MsfVenomError => e
+  $stderr.puts "Error: #{e.message}"
+  exit(1)
+end
+
+if generator_opts[:list]
+  generator_opts[:list].each do |mod|
+    case mod.downcase
+    when 'payloads', 'payload', 'p'
+      $stdout.puts dump_payloads(generator_opts[:arch])
+    when 'encoders', 'encoder', 'e'
+      $stdout.puts dump_encoders(generator_opts[:arch])
+    when 'nops', 'nop', 'n'
+      $stdout.puts dump_nops(generator_opts[:arch])
+    when 'platforms', 'platform', 'dump_platform'
+      $stdout.puts dump_platforms
+    when 'archs', 'arch', 'dump_arch'
+      $stdout.puts dump_archs
+    when 'encrypts', 'encrypt', 'encryption'
+      $stdout.puts dump_encrypt
+    when 'formats', 'format', 'f'
+      $stdout.puts dump_formats
+    when 'all', 'a'
+      $stdout.puts dump_payloads
+      $stdout.puts dump_encoders
+      $stdout.puts dump_nops
+      $stdout.puts dump_platforms
+      $stdout.puts dump_archs
+      $stdout.puts dump_encrypt
+      $stdout.puts dump_formats
+    else
+      $stderr.puts "Invalid type (#{mod}). These are valid: payloads, encoders, nops, platforms, archs, encrypt, formats, all"
+    end
+  end
+  exit(0)
+end
+
+if generator_opts[:list_options]
+  # TODO: enhance RPC to support
+  $stderr.puts "'--list-options' is not currently implemented"
+  exit(1)
+
+  payload_mod = framework.payloads.create(generator_opts[:payload])
+
+  if payload_mod.nil?
+    $stderr.puts "Invalid payload: #{generator_opts[:payload]}"
+    exit(1)
+  end
+
+  $stderr.puts "Options for #{payload_mod.fullname}:\n" + "="*25 + "\n\n"
+  $stdout.puts ::Msf::Serializer::ReadableText.dump_module(payload_mod, '    ')
+
+  $stderr.puts "\nAdvanced options for #{payload_mod.fullname}:\n" + "="*25 + "\n\n"
+  $stdout.puts ::Msf::Serializer::ReadableText.dump_advanced_options(payload_mod, '    ')
+
+  $stderr.puts "\nEvasion options for #{payload_mod.fullname}:\n" + "="*25 + "\n\n"
+  $stdout.puts ::Msf::Serializer::ReadableText.dump_evasion_options(payload_mod, '    ')
+
+  exit(0)
+end
+
+generator_opts[:cli] = true
+
+begin
+  require_dependencies
+
+  # generate payload
+  service_opts = create_generate_payload_request(generator_opts)
+  data = call_rpc(service_opts)
+  payload_base64 = data.dig(:result, :payload)
+  if data.key?(:id) && data[:id] == @id && !payload_base64.nil?
+    # $stderr.puts("payload_base64=#{payload_base64}")  # TODO: remove
+    payload = Base64.strict_decode64(payload_base64)
+  end
+
+rescue => e
+  elog("#{e.class} : #{e.message}\n#{e.backtrace * "\n"}")
+  $stderr.puts "Error: #{e.message}"
+end
+
+# No payload generated, no point to go on
+exit(2) unless payload
+
+if generator_opts[:out]
+  begin
+    ::File.open(generator_opts[:out], 'wb') do |f|
+      f.write(payload)
+    end
+    $stderr.puts "Saved as: #{generator_opts[:out]}"
+  rescue => e
+    # If I can't save it, then I can't save it. I don't think it matters what error.
+    elog("#{e.class} : #{e.message}\n#{e.backtrace * "\n"}")
+    $stderr.puts "Error: #{e.message}"
+  end
+else
+  output_stream = $stdout
+  output_stream.binmode
+  output_stream.write payload
+  # trailing newline for pretty output
+  $stderr.puts unless payload =~ /\n$/
+end
