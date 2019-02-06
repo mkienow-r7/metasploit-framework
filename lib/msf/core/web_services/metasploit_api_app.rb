@@ -1,3 +1,4 @@
+require 'rack/cors'
 require 'securerandom'
 require 'sinatra/base'
 require 'swagger/blocks'
@@ -65,6 +66,17 @@ class MetasploitApiApp < Sinatra::Base
     # store flag indicating whether authentication is initialized in the request environment
     @@auth_initialized ||= get_db.users({}).count > 0
     request.env['msf.auth_initialized'] = @@auth_initialized
+  end
+
+  use Rack::Cors do
+    allow do
+      origins '*'
+
+      resource '*',
+               :headers => :any,
+               :methods => [:get, :post, :delete, :put, :patch, :options, :head],
+               :max_age => 600
+    end
   end
 
   use Warden::Manager do |config|
